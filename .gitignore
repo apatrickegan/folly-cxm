@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+nohup.out
+app.log
+
+# C compiled output
+cxm-native/cxm-leads
+
+# Misc
+*.log
+.DS_Store
