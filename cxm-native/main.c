@@ -305,7 +305,7 @@ static void populate_leads(int tab_idx, const char *json_str, const char *query)
     if (!json_str) { gtk_label_set_text(GTK_LABEL(lbl_counts[tab_idx]),"Error"); return; }
 
     json_object *arr = json_tokener_parse(json_str);
-    if (!arr) return;
+    if (!arr || !json_object_is_type(arr, json_type_array)) { if (arr) json_object_put(arr); return; }
 
     int n = json_object_array_length(arr), shown = 0, total = 0;
     for (int i = 0; i < n; i++) {
@@ -350,7 +350,7 @@ static void populate_tasks(const char *json_str, const char *query) {
     if (!json_str) { gtk_label_set_text(GTK_LABEL(lbl_counts[4]),"Error"); return; }
 
     json_object *arr = json_tokener_parse(json_str);
-    if (!arr) return;
+    if (!arr || !json_object_is_type(arr, json_type_array)) { if (arr) json_object_put(arr); return; }
 
     int n = json_object_array_length(arr), shown = 0;
     for (int i = 0; i < n; i++) {

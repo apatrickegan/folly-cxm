@@ -8,26 +8,34 @@ LEADMOBILE = "http://5.161.104.243:5000"
 CREDS = {"username": "admin", "password": "admin123"}
 
 session = req.Session()
-_authed = False
 
 def auth():
-    global _authed
-    if not _authed:
-        r = session.post(f"{LEADMOBILE}/api/auth/login", json=CREDS)
-        _authed = r.json().get("success", False)
+    """Login and raise on failure. Re-auths if session has expired."""
+    r = session.post(f"{LEADMOBILE}/api/auth/login", json=CREDS, timeout=10)
+    if not r.json().get("success"):
+        raise RuntimeError("auth failed")
+
+def api_get(path, **kwargs):
+    """GET from leadmobile, re-authing once on 401."""
+    r = session.get(f"{LEADMOBILE}{path}", timeout=15, **kwargs)
+    if r.status_code == 401:
+        auth()
+        r = session.get(f"{LEADMOBILE}{path}", timeout=15, **kwargs)
+    r.raise_for_status()
+    return r
 
 def proxy_get(path):
-    auth()
     try:
-        r = session.get(f"{LEADMOBILE}{path}", timeout=15)
-        return jsonify(r.json())
+        return jsonify(api_get(path).json())
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
 def proxy_patch(path, data):
-    auth()
     try:
         r = session.patch(f"{LEADMOBILE}{path}", json=data, timeout=10)
+        if r.status_code == 401:
+            auth()
+            r = session.patch(f"{LEADMOBILE}{path}", json=data, timeout=10)
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -38,9 +46,8 @@ def index():
 
 @app.route("/api/leads")
 def leads():
-    auth()
     try:
-        data = session.get(f"{LEADMOBILE}/api/leads", timeout=15).json()
+        data = api_get("/api/leads").json()
         active = [l for l in data if not l.get("archived")]
         return jsonify(active)
     except Exception as e:
@@ -60,10 +67,8 @@ def update_task(lead_id, task_id):
 
 @app.route("/api/all-tasks")
 def all_tasks():
-    auth()
     try:
-        r = session.get(f"{LEADMOBILE}/api/unified-tasks?limit=200", timeout=20)
-        tasks = r.json()
+        tasks = api_get("/api/unified-tasks", params={"limit": 200}).json()
         if not isinstance(tasks, list):
             tasks = []
         # Normalize field names to match what the native app expects
