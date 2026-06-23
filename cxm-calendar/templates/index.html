@@ -154,17 +154,12 @@ body {
 /* ── Tasks ── */
 .tasks-section { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 6px; }
 .task-item { display: flex; align-items: flex-start; gap: 7px; padding: 3px 0; font-size: .68rem; line-height: 1.35; }
-.task-check {
-  width: 14px; height: 14px; border-radius: 4px;
-  border: 1.5px solid #3a4060; background: transparent;
-  cursor: pointer; flex-shrink: 0; margin-top: 1px;
-  appearance: none; -webkit-appearance: none; transition: all .1s;
+.task-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  flex-shrink: 0; margin-top: 6px; opacity: .8;
 }
-.task-check:checked { background: var(--ok); border-color: var(--ok); }
-.task-check.in_progress { border-color: var(--warn); }
-.task-check.done { background: #374151; border-color: #374151; }
+.task-src { color: #fca5a5; font-size: .55rem; margin-right: 4px; vertical-align: middle; }
 .task-title { flex: 1; color: #cbd5e1; }
-.task-title.done { text-decoration: line-through; color: var(--muted); }
 .task-due {
   color: var(--muted); font-size: .58rem; white-space: nowrap;
   background: #0e1019; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
@@ -271,7 +266,7 @@ body {
 
 <script>
 let leads = [];
-let tasks = {};        // leadId → task[]
+let tasksByLead = {};  // normalized lead name → task[] (from the unified feed, incl. Todoist)
 let filterType = 'all';
 let searchQ = '';
 let dragCard = null;
@@ -281,6 +276,7 @@ let ghost = document.getElementById('ghost');
 
 const MAX_TASKS = 5;
 const COLS = { A: 'cards-A', B: 'cards-B', C: 'cards-C', '': 'cards-X' };
+const norm = s => (s || '').trim().toLowerCase();
 
 // ── Clock ──────────────────────────────────────────────
 function tick() {
@@ -304,22 +300,23 @@ async function loadLeads() {
   const r = await fetch('/api/leads');
   leads = await r.json();
   renderAll();
-  loadTasksBatched();
+  loadAllTasks();
 }
 
-async function loadTasksBatched() {
-  const ids = leads.map(l => l.id);
-  const size = 8;
-  for (let i = 0; i < ids.length; i += size) {
-    const batch = ids.slice(i, i + size);
-    await Promise.all(batch.map(async id => {
-      try {
-        const r = await fetch(`/api/leads/${id}/tasks`);
-        tasks[id] = await r.json();
-        refreshCardTasks(id);
-      } catch {}
-    }));
-  }
+// One fetch of the unified feed (CXM + Todoist), grouped onto cards by lead name.
+async function loadAllTasks() {
+  try {
+    const r = await fetch('/api/all-tasks');
+    const all = await r.json();
+    const grouped = {};
+    (Array.isArray(all) ? all : []).forEach(t => {
+      const key = norm(t.leadName);
+      if (!key) return;                 // unlinked task (no lead) → not shown on a card
+      (grouped[key] = grouped[key] || []).push(t);
+    });
+    tasksByLead = grouped;
+    renderAll();                        // re-render so cards pick up their tasks
+  } catch {}
 }
 
 // ── Render ─────────────────────────────────────────────
@@ -395,9 +392,7 @@ function buildCard(l) {
     ${l.createdAt ? `<div class="card-added">Added ${fmtDate(l.createdAt)}</div>` : ''}
     ${l.nextStep && l.nextStep !== 'None' ? `<div class="card-step">${esc(l.nextStep)}</div>` : ''}
     ${dates ? `<div class="card-dates">${dates}</div>` : ''}
-    <div class="tasks-section" id="tasks-${l.id}">
-      <div class="tasks-loading">Loading tasks…</div>
-    </div>
+    <div class="tasks-section" id="tasks-${l.id}">${tasksHtml(l)}</div>
     <div class="card-actions" id="actions-${l.id}">
       <div class="act-btn act-complete" data-act="complete" data-id="${l.id}">✓ Complete</div>
       <div class="act-btn act-archive"  data-act="archive"  data-id="${l.id}">🗄 Archive</div>
@@ -406,8 +401,6 @@ function buildCard(l) {
 
   setupDrag(card, l);
   wireActions(card, l);
-
-  if (tasks[l.id] !== undefined) renderTasks(l.id);
   return card;
 }
 
@@ -421,54 +414,32 @@ function esc(s) {
 }
 
 // ── Tasks (up to 5 upcoming, soonest due first) ────────
-function renderTasks(leadId) {
-  const section = document.getElementById(`tasks-${leadId}`);
-  if (!section) return;
-  const t = tasks[leadId] || [];
-  if (!t.length) { section.innerHTML = ''; return; }
+// Sourced from the unified feed (CXM + Todoist), matched to the lead by name.
+function tasksHtml(lead) {
+  const t = tasksByLead[norm(lead.name)] || [];
+  if (!t.length) return '';
 
   const today = new Date().toISOString().slice(0,10);
-  const pending = t.filter(x => x.status !== 'done' && x.status !== 'cancelled')
-                   .sort((a, b) => (a.dueDate || '9999').slice(0,10).localeCompare((b.dueDate || '9999').slice(0,10)));
+  const upcoming = t.filter(x => x.status !== 'done' && x.status !== 'completed' && x.status !== 'cancelled')
+                    .sort((a, b) => (a.dueDate || '9999').slice(0,10).localeCompare((b.dueDate || '9999').slice(0,10)));
+  if (!upcoming.length) return '';
 
-  const shown = pending.slice(0, MAX_TASKS);
+  const shown = upcoming.slice(0, MAX_TASKS);
   let html = '';
   shown.forEach(task => {
-    const isIP = task.status === 'in_progress';
-    const due  = task.dueDate ? task.dueDate.slice(0,10) : '';
+    const due = task.dueDate ? task.dueDate.slice(0,10) : '';
     const overdue = due && due < today;
+    const src = task.source === 'todoist' ? '<span class="task-src" title="Todoist">◆</span>' : '';
     html += `
       <div class="task-item">
-        <input type="checkbox" class="task-check ${task.status}"
-          data-lead="${leadId}" data-task="${task.id}">
-        <span class="task-title">${esc(task.title)}</span>
+        <span class="task-dot"></span>
+        <span class="task-title">${src}${esc(task.title)}</span>
         ${due ? `<span class="task-due ${overdue?'overdue':''}">${due}</span>` : ''}
       </div>`;
   });
-  const extra = pending.length - shown.length;
+  const extra = upcoming.length - shown.length;
   if (extra > 0) html += `<div class="tasks-more">+${extra} more upcoming</div>`;
-  section.innerHTML = html;
-
-  section.querySelectorAll('.task-check').forEach(cb => {
-    cb.addEventListener('change', async e => {
-      e.stopPropagation();
-      const { lead, task } = cb.dataset;
-      const status = cb.checked ? 'done' : 'pending';
-      await fetch(`/api/leads/${lead}/tasks/${task}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status })
-      });
-      tasks[lead] = tasks[lead].map(t => t.id === task ? { ...t, status } : t);
-      renderTasks(lead);
-      toast(status === 'done' ? '✓ Task done' : '↩ Task reopened', 'ok');
-    });
-  });
-}
-
-function refreshCardTasks(leadId) {
-  const section = document.getElementById(`tasks-${leadId}`);
-  if (section) renderTasks(leadId);
+  return html;
 }
 
 // ── Complete / Archive actions ─────────────────────────
