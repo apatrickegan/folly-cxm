@@ -11,3 +11,5 @@ cxm-native/cxm-leads
 # Misc
 *.log
 .DS_Store
+folly.conf
+cxm-calendar/folly.conf

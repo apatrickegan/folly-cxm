@@ -42,6 +42,32 @@ static char *http_get(const char *url) {
     return c.buf;
 }
 
+/* POST with optional JSON body. Returns response body (caller frees) or NULL. */
+static char *http_post(const char *url, const char *json_body) {
+    CURL *h = curl_easy_init();
+    if (!h) return NULL;
+    Chunk c = { malloc(1), 0 };
+    struct curl_slist *hdrs = NULL;
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_POST, 1L);
+    if (json_body) {
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, json_body);
+    } else {
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, 0L);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, "");
+    }
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &c);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 25L);
+    CURLcode r = curl_easy_perform(h);
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+    if (r != CURLE_OK) { free(c.buf); return NULL; }
+    return c.buf;
+}
+
 /* ── State ──────────────────────────────────────────── */
 #define N_LEAD_TABS 4
 static const char *PRIORITIES[N_LEAD_TABS] = { "A", "B", "C", "" };
@@ -98,6 +124,13 @@ static const char *APP_CSS =
     ".status-pending    { color: #f97316; font-size: 10.5pt; font-weight: bold; }"
     ".status-inprogress { color: #6366f1; font-size: 10.5pt; font-weight: bold; }"
     ".status-done       { color: #374151; font-size: 10.5pt; }"
+    /* Card action buttons */
+    ".act-complete, .act-archive { font-size: 10pt; font-weight: bold;"
+    "  padding: 3px 6px; border-radius: 6px; border: 1px solid #252840;"
+    "  background-image: none; background-color: #0d0f18; color: #7681a0;"
+    "  text-shadow: none; box-shadow: none; }"
+    ".act-complete:hover { background-color: #11241a; color: #86efac; border-color: #1d5e36; }"
+    ".act-archive:hover  { background-color: #241c0e; color: #fcd34d; border-color: #6b4d12; }"
     /* Search */
     "searchentry { background-color: #13151f; color: #e2e8f0;"
     "  border: 1px solid #252840; border-radius: 4px; }";
@@ -139,6 +172,79 @@ static const char *priority_color(const char *pri) {
     return "#6b7280";
 }
 
+/* ── Card actions: Complete / Archive ────────────────── */
+static gboolean refresh_all(gpointer d);   /* forward decl */
+
+#define API_BASE "http://localhost:8080/api/leads"
+
+typedef struct { char *id; char *name; } LeadRef;
+
+static void leadref_free(gpointer p) {
+    LeadRef *lr = p;
+    if (!lr) return;
+    g_free(lr->id); g_free(lr->name); g_free(lr);
+}
+
+static void flash_toast(GtkWidget *parent, const char *msg) {
+    GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(parent),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+static void on_complete_clicked(GtkButton *b, gpointer ud) {
+    LeadRef *lr = ud;
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(b));
+    GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(top),
+        GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+        "Complete \"%s\"?\nPatrick will be emailed so he can follow up.", lr->name);
+    gtk_dialog_add_buttons(GTK_DIALOG(dlg),
+        "Cancel", GTK_RESPONSE_CANCEL, "\xE2\x9C\x93 Complete", GTK_RESPONSE_OK, NULL);
+    int resp = gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    if (resp != GTK_RESPONSE_OK) return;
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/%s/complete", API_BASE, lr->id);
+    char *r = http_post(url, NULL);
+    int ok = (r != NULL);
+    int emailed = (r && strstr(r, "\"emailSent\": true"));
+    free(r);
+    refresh_all(NULL);
+    if (ok) flash_toast(top, emailed ? "Lead completed — Patrick emailed."
+                                     : "Lead completed. (Email skipped — Resend key not set.)");
+    else    flash_toast(top, "Failed to complete lead — check the connection.");
+}
+
+static void on_archive_clicked(GtkButton *b, gpointer ud) {
+    LeadRef *lr = ud;
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(b));
+    GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(top),
+        GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+        "Archive \"%s\"?\nWhy is it being archived?", lr->name);
+    gtk_dialog_add_buttons(GTK_DIALOG(dlg),
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Expired", 1, "Lost", 2, "Other", 3, NULL);
+    int resp = gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+
+    const char *reason = NULL;
+    if (resp == 1) reason = "expired";
+    else if (resp == 2) reason = "cancelled";
+    else if (resp == 3) reason = "other";
+    if (!reason) return;
+
+    char url[256], body[64];
+    snprintf(url, sizeof(url), "%s/%s/archive", API_BASE, lr->id);
+    snprintf(body, sizeof(body), "{\"reason\":\"%s\"}", reason);
+    char *r = http_post(url, body);
+    int ok = (r != NULL);
+    free(r);
+    refresh_all(NULL);
+    if (!ok) flash_toast(top, "Failed to archive lead — check the connection.");
+}
+
 /* ── Lead card ───────────────────────────────────────── */
 static GtkWidget *make_card(json_object *lead) {
     const char *name  = json_object_get_string(json_object_object_get(lead,"name"))     ?: "—";
@@ -147,6 +253,7 @@ static GtkWidget *make_card(json_object *lead) {
     const char *step  = json_object_get_string(json_object_object_get(lead,"nextStep")) ?: "";
     const char *cre   = json_object_get_string(json_object_object_get(lead,"createdAt"))?:"";
     const char *pri   = json_object_get_string(json_object_object_get(lead,"priority")) ?: "";
+    const char *id    = json_object_get_string(json_object_object_get(lead,"id"))       ?: "";
     if (strcmp(step,"None") == 0) step = "";
 
     char date_str[32]; fmt_date(cre, date_str, sizeof(date_str));
@@ -215,6 +322,30 @@ static GtkWidget *make_card(json_object *lead) {
         gtk_label_set_xalign(GTK_LABEL(ls),0.0);
         gtk_style_context_add_class(gtk_widget_get_style_context(ls),"card-step");
         gtk_box_pack_start(GTK_BOX(vbox),ls,FALSE,FALSE,0);
+    }
+
+    /* Action buttons: Complete / Archive */
+    if (*id) {
+        GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_margin_top(actions, 4);
+
+        GtkWidget *bc = gtk_button_new_with_label("\xE2\x9C\x93 Complete");
+        gtk_style_context_add_class(gtk_widget_get_style_context(bc), "act-complete");
+        LeadRef *lr1 = g_malloc(sizeof(LeadRef));
+        lr1->id = g_strdup(id); lr1->name = g_strdup(name);
+        g_object_set_data_full(G_OBJECT(bc), "lead", lr1, leadref_free);
+        g_signal_connect(bc, "clicked", G_CALLBACK(on_complete_clicked), lr1);
+        gtk_box_pack_start(GTK_BOX(actions), bc, TRUE, TRUE, 0);
+
+        GtkWidget *ba = gtk_button_new_with_label("\xF0\x9F\x97\x84 Archive");
+        gtk_style_context_add_class(gtk_widget_get_style_context(ba), "act-archive");
+        LeadRef *lr2 = g_malloc(sizeof(LeadRef));
+        lr2->id = g_strdup(id); lr2->name = g_strdup(name);
+        g_object_set_data_full(G_OBJECT(ba), "lead", lr2, leadref_free);
+        g_signal_connect(ba, "clicked", G_CALLBACK(on_archive_clicked), lr2);
+        gtk_box_pack_start(GTK_BOX(actions), ba, TRUE, TRUE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), actions, FALSE, FALSE, 0);
     }
     return frame;
 }
