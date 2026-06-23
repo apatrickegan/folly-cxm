@@ -208,12 +208,21 @@ static void on_complete_clicked(GtkButton *b, gpointer ud) {
     char url[256];
     snprintf(url, sizeof(url), "%s/%s/complete", API_BASE, lr->id);
     char *r = http_post(url, NULL);
-    int ok = (r != NULL);
-    int emailed = (r && strstr(r, "\"emailSent\": true"));
-    free(r);
+    int ok = 0, emailed = 0;
+    if (r) {
+        json_object *resp = json_tokener_parse(r);
+        if (resp && json_object_is_type(resp, json_type_object)) {
+            json_object *o;
+            ok = json_object_object_get_ex(resp, "lead", &o);
+            if (json_object_object_get_ex(resp, "emailSent", &o))
+                emailed = json_object_get_boolean(o);
+        }
+        if (resp) json_object_put(resp);
+        free(r);
+    }
     refresh_all(NULL);
     if (ok) flash_toast(top, emailed ? "Lead completed — Patrick emailed."
-                                     : "Lead completed. (Email skipped — Resend key not set.)");
+                                     : "Lead completed. (Email skipped — add RESEND_API_KEY.)");
     else    flash_toast(top, "Failed to complete lead — check the connection.");
 }
 
