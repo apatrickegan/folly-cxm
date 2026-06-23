@@ -5,10 +5,15 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define API_LEADS     "http://localhost:8080/api/leads"
 #define API_TASKS     "http://localhost:8080/api/all-tasks"
 #define REFRESH_MS    120000
+#define SOCK_PATH     "/tmp/cxm-control.sock"
 
 /* ── HTTP ───────────────────────────────────────────── */
 typedef struct { char *buf; size_t len; } Chunk;
@@ -423,6 +428,47 @@ static GtkWidget *make_tab_label(int idx) {
 }
 
 /* ── Main ────────────────────────────────────────────── */
+
+/* socket control */
+static gboolean on_socket_data(GIOChannel *ch, GIOCondition cond, gpointer d) {
+    (void)d; (void)cond;
+    int fd = g_io_channel_unix_get_fd(ch);
+    int client = accept(fd, NULL, NULL);
+    if (client < 0) return G_SOURCE_CONTINUE;
+    char buf[256] = {0};
+    ssize_t n = read(client, buf, sizeof(buf)-1);
+    close(client);
+    if (n <= 0) return G_SOURCE_CONTINUE;
+    buf[n] = 0;
+    for (int i = 0; i < n; i++) if (buf[i] == 10) buf[i] = 0;
+    if (strncmp(buf, "tab ", 4) == 0) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), atoi(buf + 4));
+    } else if (strncmp(buf, "search ", 7) == 0) {
+        gtk_entry_set_text(GTK_ENTRY(entry_search), buf + 7);
+        g_signal_emit_by_name(entry_search, "search-changed");
+    } else if (strcmp(buf, "clear") == 0) {
+        gtk_entry_set_text(GTK_ENTRY(entry_search), "");
+        g_signal_emit_by_name(entry_search, "search-changed");
+    } else if (strcmp(buf, "refresh") == 0) {
+        refresh_all(NULL);
+    }
+    return G_SOURCE_CONTINUE;
+}
+static void setup_control_socket(void) {
+    unlink(SOCK_PATH);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return; }
+    listen(fd, 4);
+    GIOChannel *ch = g_io_channel_unix_new(fd);
+    g_io_add_watch(ch, G_IO_IN, on_socket_data, NULL);
+    g_io_channel_unref(ch);
+}
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -506,6 +552,7 @@ int main(int argc, char **argv) {
     refresh_all(NULL);
     g_timeout_add(REFRESH_MS, refresh_all, NULL);
 
+    setup_control_socket();
     gtk_main();
     curl_global_cleanup();
     return 0;
